@@ -1,0 +1,6 @@
+- Python Tutor gives line events, but multiple statements can be on the same
+  line. Transform code to have one statement per line?
+- When we see construction in an AST node, we don't know what ref number Python
+  Tutor will assign to it.
+- Test-Control will be a little bit more complicated in the presence of early
+  return
