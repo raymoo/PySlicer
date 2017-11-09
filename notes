@@ -3,4 +3,6 @@
 - When we see construction in an AST node, we don't know what ref number Python
   Tutor will assign to it.
 - Test-Control will be a little bit more complicated in the presence of early
-  return
+  return.
+- I saw that a paper "Dynamic Slicing of Python Programs" exists, but I can only
+  find it behind paywalls.
