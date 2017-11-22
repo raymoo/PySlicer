@@ -3,19 +3,79 @@ import pg_logger
 from collections import defaultdict
 from queue import Queue
 
-def trace(source):
+class VarEnvironment():
+    def __init__(self, execution_point):
+        self.heap = execution_point['heap']
+        self.globals = execution_point['globals']
+        if len(execution_point['stack_to_render']) > 0:
+            frame = execution_point['stack_to_render'][-1]
+            self.locals = frame['encoded_locals']
+            self.frame_hash = frame['unique_hash']
+        else:
+            self.locals = {}
+
+    def get_var(self, name):
+        if name in self.locals:
+            return self.frame_hash + ':' + name
+        elif name in self.globals:
+            return 'global:' + name
+        else:
+            return 'undefined:' + name
+
+    def get_ref(self, name):
+        if name in self.locals:
+            [tag, ref] = self.locals[name]
+            assert(tag == 'REF') # Ref primitives
+            return ref
+        elif name in self.globals:
+            [tag, ref] = self.globals[name]
+            assert(tag == 'REF') # Ref primitives
+            return ref
+        else:
+            return None
+
+    def vars(self):
+        my_vars = self.heap.copy()
+        
+        for name in self.globals:
+            my_vars['global:' + name] = self.globals[name]
+
+        for name in self.locals:
+            my_vars[self.frame_hash + ':' + name] = self.locals[name]
+
+        return my_vars
+        
+    # Gets changes made in the second
+    # Returns set of locations
+    def diff(self, other):
+        my_vars = self.vars()
+        their_vars = other.vars()
+
+        # New variables
+        changes = their_vars.keys() - my_vars.keys()
+
+        # Old variables that changed
+        for loc in my_vars:
+            if loc in their_vars and my_vars[loc] != their_vars[loc]:
+                changes.add(loc)
+
+        return changes
+
+ignored_events = set(['raw_input'])
+def trace(source, ri):
     def finalizer(input_code, output_trace):
-        return output_trace
+        filtered_trace = [ep for ep in output_trace if ep['event'] not in ignored_events]
+        return filtered_trace
     
     return pg_logger.exec_script_str_local(source,
-                                           '[]',
+                                           ri,
                                            True,
                                            True,
                                            finalizer)
 
 class LineMapVisitor(ast.NodeVisitor):
-    def __init__(self, the_map):
-        self.the_map = the_map
+    def __init__(self):
+        self.the_map = {}
 
     def visit(self, node):
         if isinstance(node, ast.stmt):
@@ -28,34 +88,27 @@ Currently only handles the case where statements are on separate lines.
 TODO: Transform the original source so that statements are always on separate
 lines.
 """
-def make_line_map(source):
-    the_map = {}
+def make_line_maps(source):
     astree = ast.parse(source)
-    visitor = LineMapVisitor(the_map)
-    visitor.visit(astree)
+    map_visitor = LineMapVisitor()
+    map_visitor.visit(astree)
 
-    return the_map
-
-# TODO: Support locals
-def name_to_ref(exec_point, name):
-    [tag, ref] = exec_point['globals'][name]
-    assert(tag == 'REF')
-    return ref
-
-# TODO: Support locals
-def name_to_var(exec_point, name):
-    if name in exec_point['globals']:
-        return "global:" + name
-
-    return "undefined:" + name
+    control_visitor = ControlVisitor()
+    control_visitor.visit(astree)
+    
+    return map_visitor.the_map, control_visitor.line_to_controller
 
 class UseVisitor(ast.NodeVisitor):
-    def __init__(self, exec_point, use_set):
+    def __init__(self, exec_point):
         self.exec_point = exec_point
-        self.use_set = use_set
+        self.env = VarEnvironment(exec_point)
+        self.use_set = set()
 
     def die(self, node):
-        raise ValueError('Unsupported node: ' + type(node))
+        raise ValueError('Unsupported node: ' + str(type(node)))
+
+    def nothing(self, node):
+        pass
 
     # Exprs
     # BoolOp
@@ -63,8 +116,8 @@ class UseVisitor(ast.NodeVisitor):
     # UnaryOp
     visit_Lambda = die
     # IfExp
-    visit_Dict = die
-    visit_Set = die
+    # Dict
+    # Set
     visit_ListComp = die
     visit_SetComp = die
     visit_DictComp = die
@@ -87,18 +140,22 @@ class UseVisitor(ast.NodeVisitor):
     visit_Starred = die
 
     def visit_Name(self, node):
-        self.use_set.add(name_to_ref(self.exec_point, node.id))
-        self.use_set.add(name_to_var(self.exec_point, node.id))
+        self.use_set.add(self.env.get_var(node.id))
+        self.use_set.add(self.env.get_ref(node.id))
 
     # List
     # Tuple
 
     # Stmts
-    visit_FunctionDef = die
+
+    # TODO: Is this correct? Need to account for captured vars?
+    visit_FunctionDef = nothing
+    
     visit_AsyncFunctionDef = die
     visit_ClassDef = die
-    visit_Return = die
-    visit_Delete = die # Not sure what kinds of expressions this refers to
+    # Return
+    
+    visit_Delete = die
 
     def visit_Assign(self, stmt):
         self.visit(stmt.value)
@@ -109,169 +166,176 @@ class UseVisitor(ast.NodeVisitor):
         self.visit(stmt.value)
 
     visit_AnnAssign = visit_Assign
-    visit_For = die
+
+    def visit_For(self, stmt):
+        # Ignore target
+        self.visit(stmt.iter)
+        
     visit_AsyncFor = die
-    visit_While = die
-    visit_If = die
+    
+    # While
+    
+    def visit_If(self, stmt):
+        self.visit(stmt.test)
+        
     visit_With = die
     visit_AsyncWith = die
     # Raise
     visit_Try = die
     # Assert
-    visit_Import = die
-    visit_ImportFrom = die
-    visit_Global = die
-    visit_Nonlocal = die
+    visit_Import = nothing
+    visit_ImportFrom = nothing
+    visit_Global = nothing
+    visit_Nonlocal = nothing
     # Expr
     # Pass
     # Break
     # Continue
 
-"""
-Does not currently handle that an expression could construct multiple objects.
-The trickiness is that even if we know an object will be constructed on the
-heap, we still don't know what reference id it will get when executed.
-"""
-class DefineVisitor(ast.NodeVisitor):
-    def __init__(self, exec_point, define_set):
-        self.exec_point = exec_point
-        self.define_set = define_set
+# Creates a map from statement lines to the lines of the immediately-enclosing
+# controller.
+#
+# TODO: Support unstructured control flow (break, continue, early return, etc.)
+class ControlVisitor(ast.NodeVisitor):
+    def __init__(self):
+        # Maps statements to their immediate controllers
+        self.line_to_controller = {}
+        self.enclosing_controller = 0
 
     def die(self, node):
-        raise ValueError('Unsupported node: ' + type(node))
+        raise ValueError('Unsupported node: ' + str(type(node)))
 
-    # Exprs
-    # BoolOp
-    # BinOp
-    # UnaryOp
-    visit_Lambda = die
-    # IfExp
-    visit_Dict = die
-    visit_Set = die
-    visit_ListComp = die
-    visit_SetComp = die
-    visit_DictComp = die
-    visit_GeneratorExp = die
-    visit_Await = die
-    visit_Yield = die
-    visit_YieldFrom = die
-    # Compare
-    # Call
-    # Num
-    # Str
-    # FormattedValue
-    # JoinedStr
-    # Bytes
-    # NameConstant
-    visit_Ellipsis = die
-    # Constant
-    visit_Attribute = die
-    visit_Subscript = die
-    visit_Starred = die
+    def nothing(self, node):
+        pass
 
-    def visit_Name(self, node):
-        if isinstance(node.ctx, (ast.Store, ast.Del, ast.AugStore)):
-            # TODO: Support mutable objects
-            self.define_set.add(name_to_var(self.exec_point, node.id))
+    def visit(self, node):
+        if isinstance(node, ast.stmt):
+            self.line_to_controller[node.lineno] = self.enclosing_controller
 
-    # List
-    # Tuple
+        super(ControlVisitor, self).visit(node)
+    
+    def enclosed_visit(self, lineno, node):
+        old_encloser = self.enclosing_controller
 
-    # Stmts
-    visit_FunctionDef = die
+        self.enclosing_controller = lineno
+        self.visit(node)
+        self.enclosing_controller = old_encloser
+
+    def enclosed_visits(self, lineno, nodes):
+        old_encloser = self.enclosing_controller
+
+        self.enclosing_controller = lineno
+        
+        for node in nodes:
+            self.visit(node)
+        
+        self.enclosing_controller = old_encloser
+
+    def visit_FunctionDef(self, stmt):
+        self.enclosed_visits(stmt.lineno, stmt.body)
+
     visit_AsyncFunctionDef = die
     visit_ClassDef = die
-    visit_Return = die
-    visit_Delete = die # Not sure what kinds of expressions this refers to
+    # Return - TODO: Support early return
 
-    def visit_Assign(self, stmt):
-        for target in stmt.targets:
-            self.visit(target)
-
-    def visit_AugAssign(self, stmt):
-        for target in stmt.targets:
-            self.visit(target)
-
-    visit_AnnAssign = visit_Assign
-    visit_For = die
+    def visit_IfLike(self, stmt):
+        self.enclosed_visits(stmt.lineno, stmt.body)
+        self.enclosed_visits(stmt.lineno, stmt.orelse)
+    
+    # TODO: {While, For} technically controls itself after the first iteration,
+    # because it only executes if it didn't stop on the previous iteration
+    visit_For = visit_IfLike
     visit_AsyncFor = die
-    visit_While = die
-    visit_If = die
+    visit_While = visit_IfLike
+    visit_If = visit_IfLike
+    
     visit_With = die
     visit_AsyncWith = die
-    # Raise
+
+    visit_Raise = die
     visit_Try = die
-    # Assert
-    visit_Import = die
-    visit_ImportFrom = die
-    visit_Global = die
-    visit_Nonlocal = die
-    # Expr
-    # Pass
-    # Break
-    # Continue
+
+    visit_Break = die
+    visit_Continue = die
     
 def used_stmt(exec_point, stmt):
-    use_set = set()
-    UseVisitor(exec_point, use_set).visit(stmt)
-    return use_set
+    visitor = UseVisitor(exec_point)
+    visitor.visit(stmt)
+    return visitor.use_set
 
-def defined_stmt(exec_point, stmt):
-    define_set = set()
-    DefineVisitor(exec_point, define_set).visit(stmt)
-    return define_set
+def defined_stmt(exec_point, next_exec_point):
+    now_vars = VarEnvironment(exec_point)
+    next_vars = VarEnvironment(next_exec_point)
+
+    return now_vars.diff(next_vars)
 
 # Returns a map from steps to lines and a combined UD and CT "multimap"
-def build_relations(line_map, tr):
+def build_relations(line_map, line_to_control, tr):
     # UD instead of DU, so we can go use -> definition. Similarly, use CT
     # instead of TC
     UD_CT = defaultdict(set)
     step_to_line = {}
+    line_to_step = defaultdict(set)
 
     # Reference to step
     last_definitions = {}
 
     for step, exec_point in enumerate(tr):
-        if exec_point['event'] != 'step_line':
+        if exec_point['event'] not in ['step_line', 'exception', 'uncaught_exception']:
             continue
 
         line = exec_point['line']
+        line_to_step[line].add(step)
         stmt = line_map[line]
 
         step_to_line[step] = line
 
+        # Use-Definition processing
         stmt_useds = used_stmt(exec_point,  stmt)
-        stmt_defineds = defined_stmt(tr[step + 1], stmt)
-
         for ref in stmt_useds:
             if ref in last_definitions:
                 UD_CT[step].add(last_definitions[ref])
 
-        # Could it be simpler to check which refs are changed by diffing the heap?
-        for ref in stmt_defineds:
-            last_definitions[ref] = step
+        if exec_point['event'] == 'step_line':
+            stmt_defineds = defined_stmt(tr[step], tr[step + 1])
+            for ref in stmt_defineds:
+                last_definitions[ref] = step
 
-    # TODO: CT
+        # Test-Control processing
+        # TODO: Support control dependencies caused by function calls
+        control = line_to_control[line]
+        if line_to_step[control]:
+            control_step = max(line_to_step[control])
+            UD_CT[step].add(control_step)
 
-    return step_to_line, UD_CT
+    return step_to_line, line_to_step, UD_CT
+
+def find_exception(trace):
+    for step, exec_point in enumerate(trace):
+        if exec_point['event'] in ['uncaught_exception', 'exception']:
+            return step
 
 """
 Returns a set of line numbers.
 
-Possible improvement: Allow specifying a set of locations used in the statement
-to slice, instead of all of them
+TODO: Guess or allow specification of specific values to track.
 """
 
-def slice_program(source, step):
-    line_map = make_line_map(source)
-    tr = trace(source)
-
-    step_to_line, UD_CT = build_relations(line_map, tr)
+def slice(source, ri, line=None, debug=False):
+    line_map, line_to_control = make_line_maps(source)
+    tr = trace(source, ri)
+    
+    step_to_line, line_to_step, UD_CT = build_relations(line_map, line_to_control, tr)
 
     visited = set()
     queue = Queue()
-    queue.put(step)
+    exception_step = find_exception(tr)
 
+    if exception_step:
+        print('Exception at line ' + str(step_to_line[exception_step]))
+
+    for step in [exception_step] if exception_step else line_to_step[line]:
+        queue.put(step)
     while not queue.empty():
         step = queue.get()
         if step in visited:
@@ -282,4 +346,4 @@ def slice_program(source, step):
         for infl_step in UD_CT[step]:
             queue.put(infl_step)
 
-    return sorted([step_to_line[step] for step in visited])
+    return set([step_to_line[step] for step in visited])
