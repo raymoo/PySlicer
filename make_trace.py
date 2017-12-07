@@ -61,6 +61,19 @@ class VarEnvironment():
 
         return changes
 
+# Attempts to find an attribute for a value and identifier
+def find_attribute(var_env, val, identifier):
+    assert(val[0] == 'INSTANCE')
+    
+   
+# Attempts to find a heap location for the expression.
+def find_ref(var_env, expr):
+    if isinstance(expr, ast.Name):
+        return var_env.get_ref(expr.id)
+    elif isinstance(expr, ast.Attribute):
+        instance_ref = find_ref(var_env, expr.value)
+        
+    
 ignored_events = set(['raw_input'])
 def trace(source, ri):
     def finalizer(input_code, output_trace):
@@ -161,8 +174,7 @@ class UseVisitor(ast.NodeVisitor):
         self.visit(stmt.value)
 
     def visit_AugAssign(self, stmt):
-        for target in stmt.targets:
-            self.visit(target)
+        self.visit(stmt.target)
         self.visit(stmt.value)
 
     visit_AnnAssign = visit_Assign
@@ -172,11 +184,12 @@ class UseVisitor(ast.NodeVisitor):
         self.visit(stmt.iter)
         
     visit_AsyncFor = die
-    
-    # While
-    
-    def visit_If(self, stmt):
+
+    def visit_IfLike(self, stmt):
         self.visit(stmt.test)
+
+    visit_While = visit_IfLike
+    visit_If = visit_IfLike
         
     visit_With = die
     visit_AsyncWith = die
