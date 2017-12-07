@@ -346,6 +346,8 @@ def slice(source, ri, line=None, debug=False):
 
     if exception_step:
         print('Exception at line ' + str(step_to_line[exception_step]))
+    elif not line:
+        return None, 0
 
     for step in [exception_step] if exception_step else line_to_step[line]:
         queue.put(step)
@@ -359,4 +361,7 @@ def slice(source, ri, line=None, debug=False):
         for infl_step in UD_CT[step]:
             queue.put(infl_step)
 
-    return set([step_to_line[step] for step in visited])
+    keep_these = set([step_to_line[step] for step in visited])
+    stmt_count = float(len(line_map))
+            
+    return keep_these, len(set(line_map) - keep_these) / stmt_count
