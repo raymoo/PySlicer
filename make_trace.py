@@ -62,17 +62,42 @@ class VarEnvironment():
         return changes
 
 # Attempts to find an attribute for a value and identifier
+# Returns a heap ref and a value
 def find_attribute(var_env, val, identifier):
-    assert(val[0] == 'INSTANCE')
+    if val[0] != 'INSTANCE':
+        return None, None
     
-   
-# Attempts to find a heap location for the expression.
-def find_ref(var_env, expr):
+    attr_pairs = val[2:]
+    for ref1, ref2 in attr_pairs:
+        assert(ref1[0] == 'REF')
+        assert(ref2[0] == 'REF')
+        key = var_env.heap[ref1[1]]
+        assert(key[0] == 'HEAP_PRIMITIVE')
+        assert(key[1] == 'str')
+        if key[2] == identifier:
+            value = var_env.heap[ref1[1]]
+            return ref1[1], value
+
+# Attempts to find heap locations for the expression
+# Returns a set of heap refs, plus a value for the overall expression
+def find_refs(var_env, expr):
     if isinstance(expr, ast.Name):
-        return var_env.get_ref(expr.id)
+        name_ref = var_env.get_ref(expr.id)
+        return set([name_ref]), var_env.heap[name_ref]
     elif isinstance(expr, ast.Attribute):
-        instance_ref = find_ref(var_env, expr.value)
+        instance_refs, instance = find_refs(var_env, expr.value)
+
+        if not instance:
+            return instance_refs, None
         
+        attr_ref, attr_value = find_attribute(var_env, instance, expr.attr)
+        if attr_ref:
+            instance_refs.add(attr_ref)
+            return instance_refs, attr_value
+        else:
+            return instance_refs, None
+    else:
+        raise 'Unsupported find_refs argument'
     
 ignored_events = set(['raw_input'])
 def trace(source, ri):
@@ -148,8 +173,13 @@ class UseVisitor(ast.NodeVisitor):
     # NameConstant
     visit_Ellipsis = die
     # Constant
-    visit_Attribute = die
+    
+    def visit_Attribute(self, node):
+        refs, _ = find_refs(self.env, node)
+        self.use_set |= refs
+    
     visit_Subscript = die
+    
     visit_Starred = die
 
     def visit_Name(self, node):
@@ -165,7 +195,7 @@ class UseVisitor(ast.NodeVisitor):
     visit_FunctionDef = nothing
     
     visit_AsyncFunctionDef = die
-    visit_ClassDef = die
+    visit_ClassDef = visit_FunctionDef # TODO: account for class-specific stuff
     # Return
     
     visit_Delete = die
@@ -248,7 +278,8 @@ class ControlVisitor(ast.NodeVisitor):
         self.enclosed_visits(stmt.lineno, stmt.body)
 
     visit_AsyncFunctionDef = die
-    visit_ClassDef = die
+    visit_ClassDef = visit_FunctionDef # TODO: handle class-specific things?
+
     # Return - TODO: Support early return
 
     def visit_IfLike(self, stmt):
